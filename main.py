@@ -1,5 +1,7 @@
 import ultralytics
 from my_utils import read_video, save_video
+from team_assigner import TeamAssigner
+
 from tracker import Tracker
 
 def main():
