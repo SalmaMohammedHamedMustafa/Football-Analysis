@@ -7,19 +7,11 @@ import ultralytics
 from ultralytics import YOLO
 import sys
 import numpy as np
-
-# Add parent directory to path for imports
+from sklearn.cluster import KMeans
 sys.path.append('../')
+from team_assigner import TeamAssigner
+from my_utils import get_bbox_width, get_center_of_bbox
 
-# Define utility functions if my_utils is not available
-def get_center_of_bbox(bbox):
-    """Get center coordinates of bounding box."""
-    x_center, y_center, width, height = bbox
-    return int(x_center), int(y_center)
-
-def get_bbox_width(bbox):
-    """Get width of bounding box."""
-    return int(bbox[2])
 
 class Tracker:
     """
@@ -39,6 +31,8 @@ class Tracker:
         self.model_path = Path(model_path)
         self.confidence_threshold = confidence_threshold
         self.model = None
+        self.team_assigner = TeamAssigner()
+        self.team_colors_assigned = False
         
         # Class-specific confidence thresholds for better detection
         self.class_thresholds = {
@@ -165,7 +159,7 @@ class Tracker:
             str(video_path),
             stream=True,     # Process frame by frame
             conf=0.25,       # Default confidence
-            save=False,      # Don't save, we'll handle that
+            save=False,      
             verbose=False,
             classes=[0]      # Only detect balls (class 0)
         )
@@ -361,14 +355,7 @@ class Tracker:
         }
         return class_info.get(class_id, (f'class_{class_id}', (128, 128, 128)))  # Gray for unknown classes
 
-    def _get_center_of_bbox(self, bbox):
-        """Get center coordinates of bounding box."""
-        x_center, y_center, width, height = bbox
-        return int(x_center), int(y_center)
-    
-    def _get_bbox_width(self, bbox):
-        """Get width of bounding box."""
-        return int(bbox[2])
+
     
     def _draw_triangle_above_ball(self, frame, bbox, color=(0, 255, 255)):
         """
@@ -382,13 +369,13 @@ class Tracker:
         Returns:
             Annotated frame
         """
-        x_center, y_center = self._get_center_of_bbox(bbox)
+        x_center, y_center = get_center_of_bbox(bbox)
         
         # Get top y coordinate of the ball
         height = bbox[3]
         y_top = int(y_center - height / 2)
         
-        width = self._get_bbox_width(bbox)
+        width = get_bbox_width(bbox)
         
         # Triangle dimensions
         triangle_size = max(int(width * 0.3), 20)  # Minimum size of 20 pixels
@@ -414,33 +401,44 @@ class Tracker:
     def _draw_ellipse(self, frame, bbox, color=(0, 255, 0), label=None):
         """
         Draw ellipse annotation at the bottom of bounding box (only for non-ball objects).
-        
         Args:
             frame: Input frame
             bbox: Bounding box in [x_center, y_center, width, height] format
             color: BGR color tuple
             label: Optional label text (track ID only)
-            
         Returns:
             Annotated frame
         """
-        x_center, y_center = self._get_center_of_bbox(bbox)
-        
+        def get_contrasting_text_color(bg_color):
+            """
+            Calculate contrasting text color based on background color brightness.
+            Args:
+                bg_color: BGR color tuple
+            Returns:
+                BGR color tuple for text (either black or white)
+            """
+            # Convert BGR to grayscale using standard luminance formula
+            b, g, r = bg_color
+            luminance = 0.299 * r + 0.587 * g + 0.114 * b
+
+            # If background is bright, use black text; if dark, use white text
+            return (0, 0, 0) if luminance > 127 else (255, 255, 255)
+
+        x_center, y_center = get_center_of_bbox(bbox)
         # Get bottom y coordinate
         height = bbox[3]
         y2 = int(y_center + height / 2)
-        
-        width = self._get_bbox_width(bbox)
-        
+        width = get_bbox_width(bbox)
+
         # Ensure minimum ellipse dimensions to avoid OpenCV errors
         ellipse_width = max(int(width), 10)  # Minimum width of 10 pixels
         ellipse_height = max(int(0.35 * width), 5)  # Minimum height of 5 pixels
-        
+
         # Ensure coordinates are within frame bounds
         frame_height, frame_width = frame.shape[:2]
         x_center = max(0, min(x_center, frame_width - 1))
         y2 = max(0, min(y2, frame_height - 1))
-        
+
         try:
             # Draw ellipse at bottom of bounding box with class-specific color
             cv2.ellipse(
@@ -454,49 +452,82 @@ class Tracker:
                 thickness=2,
                 lineType=cv2.LINE_4
             )
-            
+
             # Draw only the ID text UNDER the ellipse if provided
             if label:
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.5
                 thickness = 1
-                
+
                 # Calculate text dimensions
                 (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-                
+
                 # Position text BELOW the ellipse, centered
                 text_x = x_center - text_width // 2
                 text_y = y2 + ellipse_height + 20  # Start below the ellipse
-                
+
                 # Ensure text is within frame bounds
                 text_x = max(5, min(text_x, frame_width - text_width - 5))
                 text_y = max(20, min(text_y, frame_height - 5))
-                
+
+                # Get contrasting text color based on ellipse color
+                text_color = get_contrasting_text_color(color)
+
                 # Draw background rectangle for better text visibility
                 padding = 3
-                cv2.rectangle(frame, 
-                            (text_x - padding, text_y - text_height - padding),
-                            (text_x + text_width + padding, text_y + padding),
-                            color, -1)  # Same color as ellipse
-                
-                # Draw the ID text in white for contrast
-                cv2.putText(frame, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
-                
+                cv2.rectangle(frame,
+                              (text_x - padding, text_y - text_height - padding),
+                              (text_x + text_width + padding, text_y + padding),
+                              color, -1)  # Same color as ellipse
+
+                # Draw the ID text with contrasting color
+                cv2.putText(frame, label, (text_x, text_y), font, font_scale, text_color, thickness)
+
         except cv2.error as e:
             print(f"Ellipse drawing error for bbox {bbox}: {e}")
             # Fallback: draw a simple circle with color
             cv2.circle(frame, (x_center, y2), max(5, ellipse_width // 4), color, 2)
-            
-            # Simple fallback text below the circle
+
+            # Simple fallback text below the circle with contrasting color
             if label:
-                cv2.putText(frame, label, (x_center - 20, y2 + 20), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        
+                text_color = get_contrasting_text_color(color)
+                cv2.putText(frame, label, (x_center - 20, y2 + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+
         return frame
+    
+    def _assign_teams_for_frame(self, frame, frame_tracks):
+        """
+        Assign team colors for the first frame with enough players.
+        
+        Args:
+            frame: Current frame
+            frame_tracks: List of track data for this frame
+        """
+        if self.team_colors_assigned:
+            return
+        
+        # Get player detections (class 2 after conversion)
+        player_detections = {}
+        for track in frame_tracks:
+            if track['class'] == 2:  # Players (including converted goalkeepers)
+                player_detections[track['track_id']] = {
+                    'bbox': track['bbox']
+                }
+        
+        # Need at least 4 players to determine teams reliably
+        if len(player_detections) >= 4:
+            try:
+                self.team_assigner.assign_team_color(frame, player_detections)
+                self.team_colors_assigned = True
+                print(f"Team colors assigned based on {len(player_detections)} players")
+            except Exception as e:
+                print(f"Error assigning team colors: {e}")
     
     def _draw_annotations(self, frame, frame_tracks: list):
         """
         Draw tracking annotations on a frame using triangles for balls and ellipses for other objects.
+        Enhanced with team-based coloring for players.
         
         Args:
             frame: Input frame
@@ -507,14 +538,18 @@ class Tracker:
         """
         annotated_frame = frame.copy()
         
+        # Try to assign team colors if not already done
+        self._assign_teams_for_frame(annotated_frame, frame_tracks)
+        
         for track in frame_tracks:
             bbox = track['bbox']  # [x_center, y_center, width, height]
             class_id = track['class']
-            
-            # Get class-specific color and name
-            class_name, color = self.get_class_info(class_id)
+            track_id = track['track_id']
             
             if class_id == 0:  # Ball
+                # Get class-specific color and name for ball
+                class_name, color = self.get_class_info(class_id)
+                
                 # Draw triangle above the ball (no ID or class name)
                 annotated_frame = self._draw_triangle_above_ball(
                     annotated_frame, 
@@ -522,10 +557,23 @@ class Tracker:
                     color=color
                 )
             else:  # Other objects (players, referees)
-                # Create label with only track ID (no class name, no confidence)
-                label = f"ID:{track['track_id']}"
+                if class_id == 2:  # Players (including converted goalkeepers)
+                    # Get team assignment and use team color
+                    try:
+                        team_id = self.team_assigner.get_player_team(annotated_frame, bbox, track_id)
+                        color = self.team_assigner.get_team_color_bgr(team_id)
+                        label = f"ID:{track_id} T{team_id}"
+                    except Exception as e:
+                        # Fallback to default player color
+                        class_name, color = self.get_class_info(class_id)
+                        label = f"ID:{track_id}"
+                        print(f"Error getting team for player {track_id}: {e}")
+                else:
+                    # Referees and other objects use default colors
+                    class_name, color = self.get_class_info(class_id)
+                    label = f"ID:{track_id}"
                 
-                # Draw ellipse annotation with only ID
+                # Draw ellipse annotation
                 annotated_frame = self._draw_ellipse(
                     annotated_frame, 
                     bbox, 
@@ -542,6 +590,7 @@ class Tracker:
                      use_existing_tracks: bool = True) -> int:
         """
         Process video using YOLO predict on entire video (like your working method).
+        Enhanced with team assignment functionality.
         """
         input_path = Path(input_path)
         output_path = Path(output_path)
@@ -584,8 +633,9 @@ class Tracker:
         
         processed_frames = 0
         ball_frames_count = 0
+        team_assignment_frame = -1
         
-        print("Starting video annotation...")
+        print("Starting video annotation with team assignment...")
         
         try:
             while True:
@@ -602,6 +652,9 @@ class Tracker:
                         # Count frames with balls
                         if any(track['original_class'] == 0 for track in frame_tracks):
                             ball_frames_count += 1
+                        # Record when team assignment happened
+                        if self.team_colors_assigned and team_assignment_frame == -1:
+                            team_assignment_frame = processed_frames
                     else:
                         annotated_frame = frame.copy()
                 else:
@@ -612,11 +665,12 @@ class Tracker:
                 writer.write(annotated_frame)
                 processed_frames += 1
                 
-                # Progress update with ball statistics
+                # Progress update with ball and team statistics
                 if processed_frames % 100 == 0:
                     progress = (processed_frames / total_frames) * 100 if total_frames > 0 else 0
                     ball_percentage = (ball_frames_count / processed_frames) * 100
-                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}%")
+                    team_status = "assigned" if self.team_colors_assigned else "pending"
+                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}% - Teams: {team_status}")
         
         except Exception as e:
             print(f"Error during processing: {e}")
@@ -626,8 +680,15 @@ class Tracker:
         
         # Final statistics
         final_ball_percentage = (ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
-        print(f"Final ball detection statistics:")
+        print(f"Final processing statistics:")
         print(f"  Frames with ball triangles: {ball_frames_count}/{processed_frames} ({final_ball_percentage:.1f}%)")
+        if self.team_colors_assigned:
+            print(f"  Team colors assigned at frame: {team_assignment_frame}")
+            print(f"  Team 1 color (BGR): {self.team_assigner.get_team_color_bgr(1)}")
+            print(f"  Team 2 color (BGR): {self.team_assigner.get_team_color_bgr(2)}")
+            print(f"  Players assigned to teams: {len(self.team_assigner.player_team_dict)}")
+        else:
+            print(f"  Team colors: Not assigned (insufficient players)")
         
         print(f"Processing complete! {processed_frames} frames processed")
         print(f"Output saved to: {output_path}")
@@ -638,3 +699,27 @@ class Tracker:
         """Update confidence threshold."""
         self.confidence_threshold = max(0.0, min(1.0, threshold))
         print(f"Confidence threshold set to: {self.confidence_threshold}")
+    
+    def get_team_assignments(self) -> Dict[int, int]:
+        """
+        Get current player team assignments.
+        
+        Returns:
+            Dictionary mapping player_id to team_id
+        """
+        return self.team_assigner.player_team_dict.copy()
+    
+    def get_team_colors(self) -> Dict[int, tuple]:
+        """
+        Get current team colors in BGR format.
+        
+        Returns:
+            Dictionary mapping team_id to BGR color tuple
+        """
+        if not self.team_colors_assigned:
+            return {}
+        
+        return {
+            1: self.team_assigner.get_team_color_bgr(1),
+            2: self.team_assigner.get_team_color_bgr(2)
+        }

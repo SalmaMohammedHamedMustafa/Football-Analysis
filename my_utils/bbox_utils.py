@@ -1,10 +1,8 @@
 def get_center_of_bbox(bbox):
-    x1, y1, x2, y2 = bbox
-    center_x = (x1 + x2) / 2
-    center_y = (y1 + y2) / 2
-    return int(center_x), int(center_y)
+    """Get center coordinates of bounding box."""
+    x_center, y_center, width, height = bbox
+    return int(x_center), int(y_center)
 
 def get_bbox_width(bbox):
-    x1, y1, x2, y2 = bbox
-    width = x2 - x1
-    return int(width)
+    """Get width of bounding box."""
+    return int(bbox[2])
