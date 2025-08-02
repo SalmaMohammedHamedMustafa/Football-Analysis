@@ -1,16 +1,17 @@
 import os
 import cv2
 import pickle
+import pandas as pd
+import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import ultralytics
 from ultralytics import YOLO
 import sys
-import numpy as np
 from sklearn.cluster import KMeans
 sys.path.append('../')
 from team_assigner import TeamAssigner
-from my_utils import get_bbox_width, get_center_of_bbox
+from my_utils import get_bbox_width, get_center_of_bbox, get_bbox_height
 
 
 class Tracker:
@@ -18,6 +19,7 @@ class Tracker:
     Memory-efficient video tracker that processes videos in streaming mode.
     Handles object detection, tracking, and annotation rendering without
     loading entire videos into memory.
+    Enhanced with pandas-based linear interpolation for missing ball positions.
     """
     
     def __init__(self, model_path: str, confidence_threshold: float = 0.05):
@@ -205,6 +207,58 @@ class Tracker:
         print(f"  Frames with balls: {frames_with_balls} ({ball_frame_percentage:.1f}%)")
         
         return ball_detections
+
+    def _interpolate_ball_positions(self, ball_detections: Dict[int, list], total_frames: int) -> Dict[int, list]:
+        """
+        Apply pandas linear interpolation to fill missing ball positions (center only).
+        Returns the same structure as the input, with interpolated values inserted where needed.
+        """
+        # Collect center positions as a simple per-frame list
+        centers = []
+        widths = []
+        heights = []
+
+        for frame_idx in range(total_frames):
+            if frame_idx in ball_detections and len(ball_detections[frame_idx]) > 0:
+                bbox = ball_detections[frame_idx][0]['bbox']  # [x_center, y_center, width, height]
+                x, y = get_center_of_bbox(bbox)
+                centers.append({'x': x, 'y': y})
+                widths.append(get_bbox_width(bbox))
+                heights.append(get_bbox_height(bbox))
+            else:
+                centers.append({'x': np.nan, 'y': np.nan})
+                widths.append(np.nan)
+                heights.append(np.nan)
+
+        # Interpolate x/y center columns independently in a DataFrame
+        df = pd.DataFrame(centers)
+        df['width'] = widths
+        df['height'] = heights
+
+        df_interp = df.interpolate(method='linear', limit_direction='both')
+        # Fill leading/trailing NaNs if any (optional, but matches .bfill() in your example)
+        df_interp = df_interp.bfill().ffill()
+
+        # Build output dict, inserting interpolated center for missing frames
+        updated_ball_detections = ball_detections.copy()
+        for frame_idx in range(total_frames):
+            # Only fill where detection was missing
+            if frame_idx not in ball_detections or len(ball_detections[frame_idx]) == 0:
+                interp_x = float(df_interp.loc[frame_idx, 'x'])
+                interp_y = float(df_interp.loc[frame_idx, 'y'])
+                interp_w = float(df_interp.loc[frame_idx, 'width']) if not np.isnan(df_interp.loc[frame_idx, 'width']) else 30
+                interp_h = float(df_interp.loc[frame_idx, 'height']) if not np.isnan(df_interp.loc[frame_idx, 'height']) else 30
+                ball_det = {
+                    'track_id': f"ball_interpolated_{frame_idx}",
+                    'bbox': [interp_x, interp_y, interp_w, interp_h],
+                    'confidence': 0.5,
+                    'class': 0,
+                    'original_class': 0,
+                    'interpolated': True
+                }
+                updated_ball_detections[frame_idx] = [ball_det]
+        return updated_ball_detections
+
     
     def _get_tracked_detections_from_video(self, video_path: Path):
         """
@@ -273,8 +327,9 @@ class Tracker:
 
     def _generate_tracks(self, video_path: Path, tracks_path: Optional[Path] = None) -> Dict[str, Any]:
         """
-        Generate tracks using hybrid approach:
+        Generate tracks using hybrid approach with ball position interpolation:
         - YOLO predict for balls (like your working method)
+        - Linear interpolation to fill missing ball positions using pandas
         - YOLO track for players/referees (for consistent tracking)
         """
         # Try to load existing tracks
@@ -286,24 +341,31 @@ class Tracker:
             except Exception as e:
                 print(f"Failed to load tracks: {e}. Generating new tracks...")
         
-        print("Generating hybrid tracks: predict for balls, track for players...")
+        print("Generating hybrid tracks: predict for balls with interpolation, track for players...")
+        
+        # Get video info to know total frames for interpolation
+        width, height, total_frames, fps = self._get_video_info(video_path)
         
         # Get ball detections using video predict (your working method)
         ball_detections = self._get_ball_detections_from_video(video_path)
         
+        # INTERPOLATION STEP: Apply pandas linear interpolation to fill missing ball positions
+        # This is the core enhancement - post-processing step to improve ball tracking continuity
+        interpolated_ball_detections = self._interpolate_ball_positions(ball_detections, total_frames)
+        
         # Get tracked detections for players/referees
         tracked_detections = self._get_tracked_detections_from_video(video_path)
         
-        # Combine ball detections and tracked detections
+        # Combine interpolated ball detections and tracked detections
         combined_tracks = {}
-        max_frames = max(len(ball_detections), len(tracked_detections))
+        max_frames = max(len(interpolated_ball_detections), len(tracked_detections))
         
         for frame_idx in range(max_frames):
             frame_tracks = []
             
-            # Add ball detections for this frame
-            if frame_idx in ball_detections:
-                frame_tracks.extend(ball_detections[frame_idx])
+            # Add interpolated ball detections for this frame
+            if frame_idx in interpolated_ball_detections:
+                frame_tracks.extend(interpolated_ball_detections[frame_idx])
             
             # Add tracked detections for this frame
             if frame_idx in tracked_detections:
@@ -311,17 +373,19 @@ class Tracker:
             
             combined_tracks[frame_idx] = frame_tracks
         
-        # Print combined statistics
+        # Print combined statistics with interpolation details
         total_balls = sum(len([t for t in tracks if t['original_class'] == 0]) 
                          for tracks in combined_tracks.values())
+        total_interpolated_balls = sum(len([t for t in tracks if t['original_class'] == 0 and t.get('interpolated', False)]) 
+                                     for tracks in combined_tracks.values())
         total_players = sum(len([t for t in tracks if t['original_class'] in [1, 2, 3]]) 
                            for tracks in combined_tracks.values())
         frames_with_balls = sum(1 for tracks in combined_tracks.values() 
                                if any(t['original_class'] == 0 for t in tracks))
         
-        print(f"Combined tracking results:")
+        print(f"Combined tracking results with interpolation:")
         print(f"  Total frames: {max_frames}")
-        print(f"  Ball detections: {total_balls}")
+        print(f"  Ball detections: {total_balls} (including {total_interpolated_balls} interpolated)")
         print(f"  Player/referee detections: {total_players}")
         print(f"  Frames with balls: {frames_with_balls} ({frames_with_balls/max_frames*100:.1f}%)")
         
@@ -331,7 +395,7 @@ class Tracker:
             try:
                 with open(tracks_path, 'wb') as f:
                     pickle.dump(combined_tracks, f)
-                print(f"Combined tracks saved to: {tracks_path}")
+                print(f"Combined tracks with interpolation saved to: {tracks_path}")
             except Exception as e:
                 print(f"Failed to save tracks: {e}")
         
@@ -527,7 +591,7 @@ class Tracker:
     def _draw_annotations(self, frame, frame_tracks: list):
         """
         Draw tracking annotations on a frame using triangles for balls and ellipses for other objects.
-        Enhanced with team-based coloring for players.
+        Enhanced with team-based coloring for players and visual indication for interpolated balls.
         
         Args:
             frame: Input frame
@@ -549,6 +613,10 @@ class Tracker:
             if class_id == 0:  # Ball
                 # Get class-specific color and name for ball
                 class_name, color = self.get_class_info(class_id)
+                
+                # Use different color for interpolated balls to distinguish them visually
+                if track.get('interpolated', False):
+                    color = (0, 200, 200)  # Slightly different yellow/cyan for interpolated balls
                 
                 # Draw triangle above the ball (no ID or class name)
                 annotated_frame = self._draw_triangle_above_ball(
@@ -589,8 +657,8 @@ class Tracker:
                      tracks_path: Optional[str] = None,
                      use_existing_tracks: bool = True) -> int:
         """
-        Process video using YOLO predict on entire video (like your working method).
-        Enhanced with team assignment functionality.
+        Process video using YOLO predict on entire video with ball position interpolation.
+        Enhanced with team assignment functionality and pandas-based interpolation.
         """
         input_path = Path(input_path)
         output_path = Path(output_path)
@@ -601,7 +669,7 @@ class Tracker:
         
         print(f"Processing video: {input_path}")
         print(f"Output will be saved to: {output_path}")
-        print(f"Using hybrid approach: video predict for balls, video track for players")
+        print(f"Using hybrid approach with ball interpolation: video predict for balls + pandas interpolation, video track for players")
         
         # Get video properties
         try:
@@ -611,7 +679,7 @@ class Tracker:
             print(f"Error getting video info: {e}")
             return 0
         
-        # Generate or load tracks using hybrid approach
+        # Generate or load tracks using hybrid approach with interpolation
         tracks = None
         if use_existing_tracks and tracks_path:
             try:
@@ -633,9 +701,10 @@ class Tracker:
         
         processed_frames = 0
         ball_frames_count = 0
+        interpolated_ball_frames_count = 0
         team_assignment_frame = -1
         
-        print("Starting video annotation with team assignment...")
+        print("Starting video annotation with team assignment and interpolated ball positions...")
         
         try:
             while True:
@@ -645,13 +714,15 @@ class Tracker:
                 
                 # Get tracking data for current frame
                 if tracks and processed_frames in tracks:
-                    # Use pre-generated hybrid tracks
+                    # Use pre-generated hybrid tracks with interpolation
                     frame_tracks = tracks[processed_frames]
                     if frame_tracks:
                         annotated_frame = self._draw_annotations(frame, frame_tracks)
-                        # Count frames with balls
+                        # Count frames with balls and interpolated balls
                         if any(track['original_class'] == 0 for track in frame_tracks):
                             ball_frames_count += 1
+                            if any(track.get('interpolated', False) for track in frame_tracks if track['original_class'] == 0):
+                                interpolated_ball_frames_count += 1
                         # Record when team assignment happened
                         if self.team_colors_assigned and team_assignment_frame == -1:
                             team_assignment_frame = processed_frames
@@ -665,12 +736,13 @@ class Tracker:
                 writer.write(annotated_frame)
                 processed_frames += 1
                 
-                # Progress update with ball and team statistics
+                # Progress update with ball, interpolation, and team statistics
                 if processed_frames % 100 == 0:
                     progress = (processed_frames / total_frames) * 100 if total_frames > 0 else 0
                     ball_percentage = (ball_frames_count / processed_frames) * 100
+                    interpolated_percentage = (interpolated_ball_frames_count / processed_frames) * 100
                     team_status = "assigned" if self.team_colors_assigned else "pending"
-                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}% - Teams: {team_status}")
+                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}% (interpolated: {interpolated_percentage:.1f}%) - Teams: {team_status}")
         
         except Exception as e:
             print(f"Error during processing: {e}")
@@ -678,10 +750,12 @@ class Tracker:
             cap.release()
             writer.release()
         
-        # Final statistics
+        # Final statistics with interpolation details
         final_ball_percentage = (ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
+        final_interpolated_percentage = (interpolated_ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
         print(f"Final processing statistics:")
         print(f"  Frames with ball triangles: {ball_frames_count}/{processed_frames} ({final_ball_percentage:.1f}%)")
+        print(f"  Frames with interpolated balls: {interpolated_ball_frames_count}/{processed_frames} ({final_interpolated_percentage:.1f}%)")
         if self.team_colors_assigned:
             print(f"  Team colors assigned at frame: {team_assignment_frame}")
             print(f"  Team 1 color (BGR): {self.team_assigner.get_team_color_bgr(1)}")

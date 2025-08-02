@@ -6,3 +6,7 @@ def get_center_of_bbox(bbox):
 def get_bbox_width(bbox):
     """Get width of bounding box."""
     return int(bbox[2])
+
+def get_bbox_height(bbox):
+    """Get height of bounding box."""
+    return int(bbox[3])
