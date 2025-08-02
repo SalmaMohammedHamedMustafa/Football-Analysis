@@ -12,6 +12,7 @@ from sklearn.cluster import KMeans
 sys.path.append('../')
 from team_assigner import TeamAssigner
 from my_utils import get_bbox_width, get_center_of_bbox, get_bbox_height
+from ball_control_tracker import BallControlTracker
 
 
 class Tracker:
@@ -43,6 +44,11 @@ class Tracker:
             2: 0.1,    # player - moderate threshold  
             3: 0.1     # referee - moderate threshold
         }
+        self.ball_control_tracker = BallControlTracker(
+            possession_distance_threshold=100.0,  # Adjust based on your video resolution
+            min_frames_for_possession=3,          # Frames needed to confirm possession change
+            possession_smoothing_window=5         # Smoothing window size
+            )
         
         self._load_model()
     
@@ -559,43 +565,17 @@ class Tracker:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
 
         return frame
-    
-    def _assign_teams_for_frame(self, frame, frame_tracks):
-        """
-        Assign team colors for the first frame with enough players.
-        
-        Args:
-            frame: Current frame
-            frame_tracks: List of track data for this frame
-        """
-        if self.team_colors_assigned:
-            return
-        
-        # Get player detections (class 2 after conversion)
-        player_detections = {}
-        for track in frame_tracks:
-            if track['class'] == 2:  # Players (including converted goalkeepers)
-                player_detections[track['track_id']] = {
-                    'bbox': track['bbox']
-                }
-        
-        # Need at least 4 players to determine teams reliably
-        if len(player_detections) >= 4:
-            try:
-                self.team_assigner.assign_team_color(frame, player_detections)
-                self.team_colors_assigned = True
-                print(f"Team colors assigned based on {len(player_detections)} players")
-            except Exception as e:
-                print(f"Error assigning team colors: {e}")
-    
-    def _draw_annotations(self, frame, frame_tracks: list):
+
+    def _draw_annotations(self, frame, frame_tracks: list, frame_idx: int = 0):
         """
         Draw tracking annotations on a frame using triangles for balls and ellipses for other objects.
-        Enhanced with team-based coloring for players and visual indication for interpolated balls.
+        Enhanced with team-based coloring for players, visual indication for interpolated balls,
+        and ball control/possession tracking.
         
         Args:
             frame: Input frame
             frame_tracks: List of track data for this frame
+            frame_idx: Current frame index for possession tracking
             
         Returns:
             Annotated frame
@@ -605,6 +585,35 @@ class Tracker:
         # Try to assign team colors if not already done
         self._assign_teams_for_frame(annotated_frame, frame_tracks)
         
+        # Extract ball and player information for possession analysis
+        ball_bbox = None
+        player_tracks = []
+        
+        # Separate ball and player tracks for possession analysis
+        for track in frame_tracks:
+            if track['class'] == 0:  # Ball
+                ball_bbox = track['bbox']
+            elif track['class'] == 2:  # Players (including converted goalkeepers)
+                player_tracks.append(track)
+        
+        # Update ball control analysis
+        current_possession = None
+        if self.team_colors_assigned:  # Only track possession after teams are assigned
+            current_possession = self.ball_control_tracker.update_ball_control(
+                frame_idx=frame_idx,
+                ball_bbox=ball_bbox,
+                player_tracks=player_tracks,
+                team_assignments=self.team_assigner.player_team_dict
+            )
+        
+        # Draw possession indicator if we have possession data
+        if current_possession is not None:
+            team_colors = self.get_team_colors()
+            annotated_frame = self.ball_control_tracker.draw_possession_indicator(
+                annotated_frame, current_possession, team_colors
+            )
+        
+        # Draw annotations for all tracked objects
         for track in frame_tracks:
             bbox = track['bbox']  # [x_center, y_center, width, height]
             class_id = track['class']
@@ -650,15 +659,15 @@ class Tracker:
                 )
         
         return annotated_frame
-    
+
     def process_video(self, 
-                     input_path: str, 
-                     output_path: str,
-                     tracks_path: Optional[str] = None,
-                     use_existing_tracks: bool = True) -> int:
+                    input_path: str, 
+                    output_path: str,
+                    tracks_path: Optional[str] = None,
+                    use_existing_tracks: bool = True) -> int:
         """
         Process video using YOLO predict on entire video with ball position interpolation.
-        Enhanced with team assignment functionality and pandas-based interpolation.
+        Enhanced with team assignment functionality, pandas-based interpolation, and ball control tracking.
         """
         input_path = Path(input_path)
         output_path = Path(output_path)
@@ -669,7 +678,7 @@ class Tracker:
         
         print(f"Processing video: {input_path}")
         print(f"Output will be saved to: {output_path}")
-        print(f"Using hybrid approach with ball interpolation: video predict for balls + pandas interpolation, video track for players")
+        print(f"Using hybrid approach with ball interpolation and possession tracking: video predict for balls + pandas interpolation, video track for players")
         
         # Get video properties
         try:
@@ -678,6 +687,15 @@ class Tracker:
         except Exception as e:
             print(f"Error getting video info: {e}")
             return 0
+        
+        # Reset ball control tracker for new video
+        self.ball_control_tracker.reset()
+        
+        # Auto-adjust possession distance threshold based on video resolution
+        video_resolution_factor = min(width, height) / 720  # Base on 720p
+        adjusted_distance_threshold = 100.0 * video_resolution_factor
+        self.ball_control_tracker.possession_distance_threshold = adjusted_distance_threshold
+        print(f"Ball possession distance threshold auto-adjusted to: {adjusted_distance_threshold:.1f} pixels")
         
         # Generate or load tracks using hybrid approach with interpolation
         tracks = None
@@ -703,8 +721,9 @@ class Tracker:
         ball_frames_count = 0
         interpolated_ball_frames_count = 0
         team_assignment_frame = -1
+        possession_start_frame = -1
         
-        print("Starting video annotation with team assignment and interpolated ball positions...")
+        print("Starting video annotation with team assignment, interpolated ball positions, and possession tracking...")
         
         try:
             while True:
@@ -717,15 +736,23 @@ class Tracker:
                     # Use pre-generated hybrid tracks with interpolation
                     frame_tracks = tracks[processed_frames]
                     if frame_tracks:
-                        annotated_frame = self._draw_annotations(frame, frame_tracks)
+                        # Pass frame index for possession tracking
+                        annotated_frame = self._draw_annotations(frame, frame_tracks, processed_frames)
+                        
                         # Count frames with balls and interpolated balls
                         if any(track['original_class'] == 0 for track in frame_tracks):
                             ball_frames_count += 1
                             if any(track.get('interpolated', False) for track in frame_tracks if track['original_class'] == 0):
                                 interpolated_ball_frames_count += 1
+                        
                         # Record when team assignment happened
                         if self.team_colors_assigned and team_assignment_frame == -1:
                             team_assignment_frame = processed_frames
+                        
+                        # Record when possession tracking started
+                        current_possession = self.ball_control_tracker.get_current_possession()
+                        if current_possession is not None and possession_start_frame == -1:
+                            possession_start_frame = processed_frames
                     else:
                         annotated_frame = frame.copy()
                 else:
@@ -736,13 +763,18 @@ class Tracker:
                 writer.write(annotated_frame)
                 processed_frames += 1
                 
-                # Progress update with ball, interpolation, and team statistics
+                # Progress update with ball, interpolation, team, and possession statistics
                 if processed_frames % 100 == 0:
                     progress = (processed_frames / total_frames) * 100 if total_frames > 0 else 0
                     ball_percentage = (ball_frames_count / processed_frames) * 100
                     interpolated_percentage = (interpolated_ball_frames_count / processed_frames) * 100
                     team_status = "assigned" if self.team_colors_assigned else "pending"
-                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}% (interpolated: {interpolated_percentage:.1f}%) - Teams: {team_status}")
+                    
+                    # Get current possession info for progress updates
+                    current_possession = self.ball_control_tracker.get_current_possession()
+                    possession_status = f"Team {current_possession}" if current_possession else "none"
+                    
+                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}% (interpolated: {interpolated_percentage:.1f}%) - Teams: {team_status} - Possession: {possession_status}")
         
         except Exception as e:
             print(f"Error during processing: {e}")
@@ -750,24 +782,96 @@ class Tracker:
             cap.release()
             writer.release()
         
-        # Final statistics with interpolation details
+        # Final statistics with interpolation and possession details
         final_ball_percentage = (ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
         final_interpolated_percentage = (interpolated_ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
-        print(f"Final processing statistics:")
+        
+        print(f"\n" + "="*60)
+        print(f"FINAL PROCESSING STATISTICS")
+        print(f"="*60)
+        
+        # Ball detection statistics
+        print(f"Ball Detection:")
         print(f"  Frames with ball triangles: {ball_frames_count}/{processed_frames} ({final_ball_percentage:.1f}%)")
         print(f"  Frames with interpolated balls: {interpolated_ball_frames_count}/{processed_frames} ({final_interpolated_percentage:.1f}%)")
+        
+        # Team assignment statistics
         if self.team_colors_assigned:
+            print(f"\nTeam Assignment:")
             print(f"  Team colors assigned at frame: {team_assignment_frame}")
             print(f"  Team 1 color (BGR): {self.team_assigner.get_team_color_bgr(1)}")
             print(f"  Team 2 color (BGR): {self.team_assigner.get_team_color_bgr(2)}")
             print(f"  Players assigned to teams: {len(self.team_assigner.player_team_dict)}")
+            
+            # Display team assignments
+            team_1_players = [pid for pid, tid in self.team_assigner.player_team_dict.items() if tid == 1]
+            team_2_players = [pid for pid, tid in self.team_assigner.player_team_dict.items() if tid == 2]
+            print(f"  Team 1 players: {sorted(team_1_players)}")
+            print(f"  Team 2 players: {sorted(team_2_players)}")
         else:
+            print(f"\nTeam Assignment:")
             print(f"  Team colors: Not assigned (insufficient players)")
         
+        # Ball possession statistics
+        possession_stats = self.ball_control_tracker.get_possession_stats(processed_frames)
+        print(f"\nBall Possession Analysis:")
+        print(f"  Possession tracking started at frame: {possession_start_frame if possession_start_frame != -1 else 'N/A'}")
+        print(f"  Total frames with possession data: {possession_stats['frames_with_possession']}/{possession_stats['total_frames']} ({possession_stats['possession_percentage']:.1f}%)")
+        
+        if possession_stats['frames_with_possession'] > 0:
+            print(f"  Team 1 possession: {possession_stats['team_1_frames']} frames ({possession_stats['team_1_percentage']:.1f}%)")
+            print(f"  Team 2 possession: {possession_stats['team_2_frames']} frames ({possession_stats['team_2_percentage']:.1f}%)")
+            print(f"  Possession changes: {possession_stats['possession_changes']}")
+            print(f"  Average possession duration: {possession_stats['average_possession_duration']:.1f} frames ({possession_stats['average_possession_duration']/fps:.1f} seconds)")
+            
+            # Calculate possession ratio
+            if possession_stats['team_1_percentage'] > 0 and possession_stats['team_2_percentage'] > 0:
+                ratio = possession_stats['team_1_percentage'] / possession_stats['team_2_percentage']
+                print(f"  Possession ratio (Team 1:Team 2): {ratio:.2f}:1")
+            
+            # Possession quality metrics
+            if possession_stats['possession_changes'] > 0:
+                changes_per_minute = (possession_stats['possession_changes'] / processed_frames) * fps * 60
+                print(f"  Possession changes per minute: {changes_per_minute:.1f}")
+        else:
+            print(f"  No possession data available (teams not assigned or ball not detected sufficiently)")
+        
+        print(f"\nOutput saved to: {output_path}")
         print(f"Processing complete! {processed_frames} frames processed")
-        print(f"Output saved to: {output_path}")
+        print(f"="*60)
         
         return processed_frames
+    
+    def _assign_teams_for_frame(self, frame, frame_tracks):
+        """
+        Assign team colors for the first frame with enough players.
+        
+        Args:
+            frame: Current frame
+            frame_tracks: List of track data for this frame
+        """
+        if self.team_colors_assigned:
+            return
+        
+        # Get player detections (class 2 after conversion)
+        player_detections = {}
+        for track in frame_tracks:
+            if track['class'] == 2:  # Players (including converted goalkeepers)
+                player_detections[track['track_id']] = {
+                    'bbox': track['bbox']
+                }
+        
+        # Need at least 4 players to determine teams reliably
+        if len(player_detections) >= 4:
+            try:
+                self.team_assigner.assign_team_color(frame, player_detections)
+                self.team_colors_assigned = True
+                print(f"Team colors assigned based on {len(player_detections)} players")
+            except Exception as e:
+                print(f"Error assigning team colors: {e}")
+    
+
+
     
     def set_confidence_threshold(self, threshold: float) -> None:
         """Update confidence threshold."""
@@ -781,6 +885,7 @@ class Tracker:
         Returns:
             Dictionary mapping player_id to team_id
         """
+        
         return self.team_assigner.player_team_dict.copy()
     
     def get_team_colors(self) -> Dict[int, tuple]:
@@ -797,3 +902,28 @@ class Tracker:
             1: self.team_assigner.get_team_color_bgr(1),
             2: self.team_assigner.get_team_color_bgr(2)
         }
+
+
+    def get_current_possession(self) -> Optional[int]:
+        """Get the current team in possession."""
+        return self.ball_control_tracker.get_current_possession()
+
+    def get_possession_stats(self) -> dict:
+        """Get comprehensive possession statistics."""
+        # You'll need to track total frames processed
+        return self.ball_control_tracker.get_possession_stats(self.total_frames_processed)
+
+    def get_possession_history(self) -> list[Tuple[int, int]]:
+        """Get possession change history as list of (frame_idx, team_id) tuples."""
+        return self.ball_control_tracker.possession_history.copy()
+
+    def set_possession_parameters(self, distance_threshold: float = None,
+                                min_frames: int = None, 
+                                smoothing_window: int = None):
+        """Update possession tracking parameters."""
+        if distance_threshold is not None:
+            self.ball_control_tracker.possession_distance_threshold = distance_threshold
+        if min_frames is not None:
+            self.ball_control_tracker.min_frames_for_possession = min_frames
+        if smoothing_window is not None:
+            self.ball_control_tracker.possession_smoothing_window = smoothing_window
