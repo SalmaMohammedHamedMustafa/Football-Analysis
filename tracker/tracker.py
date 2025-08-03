@@ -14,6 +14,7 @@ from team_assigner import TeamAssigner
 from my_utils import get_bbox_width, get_center_of_bbox, get_bbox_height
 from ball_control_tracker import BallControlTracker
 from camera_movement_estimator import CameraMovementEstimator
+from view_transformer import ViewTransformer
 
 
 class Tracker:
@@ -39,6 +40,7 @@ class Tracker:
         self.team_colors_assigned = False
         self.camera_movement_estimator = None
         self.camera_movement_per_frame = None
+        self.view_transformer = ViewTransformer()
         
         # Class-specific confidence thresholds for better detection
         self.class_thresholds = {
@@ -105,43 +107,58 @@ class Tracker:
         
         print(f"Camera movement estimation complete: {len(self.camera_movement_per_frame)} frames")
     
-    def _adjust_tracks_for_camera_movement(self, tracks: dict[int, list], frame_idx: int) -> list:
+    def _adjust_tracks_for_camera_movement(self, tracks: list, frame_idx: int) -> list:
         """
-        Adjust track positions for camera movement.
+        Adjust track positions for camera movement and add transformed positions.
         
         Args:
             tracks: List of tracks for current frame
             frame_idx: Current frame index
             
         Returns:
-            Adjusted tracks
+            Adjusted tracks with transformed positions
         """
         if (self.camera_movement_estimator is None or 
             self.camera_movement_per_frame is None or 
             frame_idx >= len(self.camera_movement_per_frame)):
-            return tracks
+            adjusted_tracks = tracks
+        else:
+            camera_movement = self.camera_movement_per_frame[frame_idx]
+            adjusted_tracks = []
+            
+            for track in tracks:
+                adjusted_track = track.copy()
+                
+                # Adjust bounding box for camera movement
+                adjusted_bbox = self.camera_movement_estimator.adjust_bbox_for_camera_movement(
+                    track['bbox'], camera_movement
+                )
+                adjusted_track['bbox'] = adjusted_bbox
+                
+                # Store original and adjusted positions for analysis
+                original_center = get_center_of_bbox(track['bbox'])
+                adjusted_center = get_center_of_bbox(adjusted_bbox)
+                
+                adjusted_track['position_original'] = original_center
+                adjusted_track['position_adjusted'] = adjusted_center
+                adjusted_track['camera_movement'] = camera_movement
+                
+                adjusted_tracks.append(adjusted_track)
         
-        camera_movement = self.camera_movement_per_frame[frame_idx]
-        adjusted_tracks = []
-        
-        for track in tracks:
-            adjusted_track = track.copy()
+        # Add transformed positions for all tracks
+        for track in adjusted_tracks:
+            # Use adjusted position if available, otherwise use original position
+            if 'position_adjusted' in track:
+                position = np.array(track['position_adjusted'])
+            else:
+                position = np.array(get_center_of_bbox(track['bbox']))
             
-            # Adjust bounding box for camera movement
-            adjusted_bbox = self.camera_movement_estimator.adjust_bbox_for_camera_movement(
-                track['bbox'], camera_movement
-            )
-            adjusted_track['bbox'] = adjusted_bbox
+            # Transform the position to real-world coordinates
+            position_transformed = self.view_transformer.transform_point(position)
+            if position_transformed is not None:
+                position_transformed = position_transformed.squeeze().tolist()
             
-            # Store original and adjusted positions for analysis
-            original_center = get_center_of_bbox(track['bbox'])
-            adjusted_center = get_center_of_bbox(adjusted_bbox)
-            
-            adjusted_track['position_original'] = original_center
-            adjusted_track['position_adjusted'] = adjusted_center
-            adjusted_track['camera_movement'] = camera_movement
-            
-            adjusted_tracks.append(adjusted_track)
+            track['position_transformed'] = position_transformed
         
         return adjusted_tracks
     
@@ -415,8 +432,8 @@ class Tracker:
 
     def _generate_tracks_with_camera_adjustment(self, video_path: Path, tracks_path: Optional[Path] = None) -> Dict[str, Any]:
         """
-        Generate tracks with camera movement adjustment.
-        This is your existing _generate_tracks method with camera movement integration.
+        Generate tracks with camera movement adjustment and view transformation.
+        This is your existing _generate_tracks method with camera movement integration and view transformation.
         """
         # Try to load existing tracks
         if tracks_path and tracks_path.exists():
@@ -425,19 +442,45 @@ class Tracker:
                 with open(tracks_path, 'rb') as f:
                     tracks = pickle.load(f)
                     
-                # Check if tracks already have camera movement adjustment
-                if any('position_adjusted' in track for frame_tracks in tracks.values() 
-                       for track in frame_tracks):
-                    print("Tracks already contain camera movement adjustments")
+                # Check if tracks already have camera movement adjustment and view transformation
+                sample_tracks = next(iter(tracks.values())) if tracks else []
+                has_camera_adjustment = any('position_adjusted' in track for track in sample_tracks)
+                has_view_transformation = any('position_transformed' in track for track in sample_tracks)
+                
+                if has_camera_adjustment and has_view_transformation:
+                    print("Tracks already contain camera movement adjustments and view transformations")
+                    return tracks
+                elif has_camera_adjustment and not has_view_transformation:
+                    print("Tracks have camera movement adjustments but need view transformation")
+                    # Add view transformations to existing tracks
+                    for frame_idx, frame_tracks in tracks.items():
+                        for track in frame_tracks:
+                            if 'position_adjusted' in track:
+                                position = np.array(track['position_adjusted'])
+                            else:
+                                position = np.array(get_center_of_bbox(track['bbox']))
+                            
+                            position_transformed = self.view_transformer.transform_point(position)
+                            if position_transformed is not None:
+                                position_transformed = position_transformed.squeeze().tolist()
+                            
+                            track['position_transformed'] = position_transformed
+                    
+                    # Save updated tracks
+                    if tracks_path:
+                        with open(tracks_path, 'wb') as f:
+                            pickle.dump(tracks, f)
+                        print("Updated tracks with view transformations saved")
+                    
                     return tracks
                 else:
-                    print("Tracks loaded but need camera movement adjustment")
+                    print("Tracks loaded but need camera movement adjustment and view transformation")
                     
             except Exception as e:
                 print(f"Failed to load tracks: {e}. Generating new tracks...")
         
         # Generate tracks using your existing method
-        print("Generating tracks with camera movement adjustment...")
+        print("Generating tracks with camera movement adjustment and view transformation...")
         
         # Get video info
         width, height, total_frames, fps = self._get_video_info(video_path)
@@ -466,9 +509,8 @@ class Tracker:
             if frame_idx in tracked_detections:
                 frame_tracks.extend(tracked_detections[frame_idx])
             
-            # Apply camera movement adjustment if available
-            if self.camera_movement_per_frame is not None:
-                frame_tracks = self._adjust_tracks_for_camera_movement(frame_tracks, frame_idx)
+            # Apply camera movement adjustment and view transformation
+            frame_tracks = self._adjust_tracks_for_camera_movement(frame_tracks, frame_idx)
             
             combined_tracks[frame_idx] = frame_tracks
         
@@ -478,7 +520,7 @@ class Tracker:
             try:
                 with open(tracks_path, 'wb') as f:
                     pickle.dump(combined_tracks, f)
-                print(f"Tracks with camera adjustment saved to: {tracks_path}")
+                print(f"Tracks with camera adjustment and view transformation saved to: {tracks_path}")
             except Exception as e:
                 print(f"Failed to save tracks: {e}")
         
@@ -745,17 +787,17 @@ class Tracker:
         return annotated_frame
 
     def process_video(self, 
-                input_path: str, 
-                output_path: str,
-                tracks_path: Optional[str] = None,
-                camera_movement_stub_path: Optional[str] = None,
-                use_existing_tracks: bool = True,
-                use_camera_movement: bool = True,
-                show_camera_movement: bool = True) -> int:
+            input_path: str, 
+            output_path: str,
+            tracks_path: Optional[str] = None,
+            camera_movement_stub_path: Optional[str] = None,
+            use_existing_tracks: bool = True,
+            use_camera_movement: bool = True,
+            show_camera_movement: bool = True) -> int:
         """
         Process video using YOLO predict on entire video with ball position interpolation.
         Enhanced with team assignment functionality, pandas-based interpolation, ball control tracking,
-        and camera movement compensation.
+        camera movement compensation, and view transformation.
         """
         input_path = Path(input_path)
         output_path = Path(output_path)
@@ -767,8 +809,9 @@ class Tracker:
         
         print(f"Processing video: {input_path}")
         print(f"Output will be saved to: {output_path}")
-        print(f"Using hybrid approach with ball interpolation and possession tracking: video predict for balls + pandas interpolation, video track for players")
+        print(f"Using hybrid approach with ball interpolation, possession tracking, and view transformation: video predict for balls + pandas interpolation, video track for players")
         print(f"Camera movement compensation: {'Enabled' if use_camera_movement else 'Disabled'}")
+        print(f"View transformation: Enabled (court coordinates)")
         
         # Get video properties
         try:
@@ -802,7 +845,7 @@ class Tracker:
         self.ball_control_tracker.possession_distance_threshold = adjusted_distance_threshold
         print(f"Ball possession distance threshold auto-adjusted to: {adjusted_distance_threshold:.1f} pixels")
         
-        # Generate or load tracks using hybrid approach with interpolation and camera movement
+        # Generate or load tracks using hybrid approach with interpolation, camera movement, and view transformation
         tracks = None
         if use_existing_tracks and tracks_path:
             try:
@@ -830,8 +873,9 @@ class Tracker:
         interpolated_ball_frames_count = 0
         team_assignment_frame = -1
         possession_start_frame = -1
+        transformed_positions_count = 0
         
-        print("Starting video annotation with team assignment, interpolated ball positions, and possession tracking...")
+        print("Starting video annotation with team assignment, interpolated ball positions, possession tracking, and view transformation...")
         if use_camera_movement:
             print("Camera movement compensation is active")
         
@@ -843,7 +887,7 @@ class Tracker:
                 
                 # Get tracking data for current frame
                 if tracks and processed_frames in tracks:
-                    # Use pre-generated hybrid tracks with interpolation and camera adjustment
+                    # Use pre-generated hybrid tracks with interpolation, camera adjustment, and view transformation
                     frame_tracks = tracks[processed_frames]
                     if frame_tracks:
                         # Pass frame index for possession tracking and show camera movement if enabled
@@ -856,6 +900,9 @@ class Tracker:
                             ball_frames_count += 1
                             if any(track.get('interpolated', False) for track in frame_tracks if track['original_class'] == 0):
                                 interpolated_ball_frames_count += 1
+                        
+                        # Count transformed positions
+                        transformed_positions_count += sum(1 for track in frame_tracks if track.get('position_transformed') is not None)
                         
                         # Record when team assignment happened
                         if self.team_colors_assigned and team_assignment_frame == -1:
@@ -891,7 +938,7 @@ class Tracker:
                 writer.write(annotated_frame)
                 processed_frames += 1
                 
-                # Progress update with ball, interpolation, team, possession, and camera movement statistics
+                # Progress update with ball, interpolation, team, possession, camera movement, and view transformation statistics
                 if processed_frames % 100 == 0:
                     progress = (processed_frames / total_frames) * 100 if total_frames > 0 else 0
                     ball_percentage = (ball_frames_count / processed_frames) * 100
@@ -905,7 +952,10 @@ class Tracker:
                     # Camera movement status for progress
                     camera_status = "enabled" if use_camera_movement else "disabled"
                     
-                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}% (interpolated: {interpolated_percentage:.1f}%) - Teams: {team_status} - Possession: {possession_status} - Camera: {camera_status}")
+                    # View transformation status
+                    transform_percentage = (transformed_positions_count / (processed_frames * 10)) * 100 if processed_frames > 0 else 0  # Rough estimate
+                    
+                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball: {ball_percentage:.1f}% (interp: {interpolated_percentage:.1f}%) - Teams: {team_status} - Possession: {possession_status} - Camera: {camera_status} - Transforms: {transform_percentage:.1f}%")
         
         except Exception as e:
             print(f"Error during processing: {e}")
@@ -913,7 +963,7 @@ class Tracker:
             cap.release()
             writer.release()
         
-        # Final statistics with interpolation, possession, and camera movement details
+        # Final statistics with interpolation, possession, camera movement, and view transformation details
         final_ball_percentage = (ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
         final_interpolated_percentage = (interpolated_ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
         
@@ -1007,6 +1057,26 @@ class Tracker:
                 print(f"  Camera movement data: Not available (calculation failed)")
             else:
                 print(f"  Camera movement tracking was disabled")
+        
+        # View transformation statistics
+        print(f"\nView Transformation Analysis:")
+        print(f"  View transformation: Enabled (pixel to court coordinates)")
+        print(f"  Total transformed positions: {transformed_positions_count}")
+        
+        if tracks:
+            # Count successful transformations across all frames
+            total_tracks = sum(len(frame_tracks) for frame_tracks in tracks.values())
+            successful_transforms = sum(1 for frame_tracks in tracks.values() 
+                                    for track in frame_tracks 
+                                    if track.get('position_transformed') is not None)
+            failed_transforms = total_tracks - successful_transforms
+            transform_success_rate = (successful_transforms / total_tracks) * 100 if total_tracks > 0 else 0
+            
+            print(f"  Successful transformations: {successful_transforms}/{total_tracks} ({transform_success_rate:.1f}%)")
+            print(f"  Failed transformations: {failed_transforms} (objects outside court boundaries)")
+            print(f"  Court dimensions: 68m x 23.32m")
+            print(f"  Pixel vertices: {self.view_transformer.pixel_vertices.tolist()}")
+            print(f"  Target vertices: {self.view_transformer.target_vertices.tolist()}")
         
         print(f"\nOutput saved to: {output_path}")
         print(f"Processing complete! {processed_frames} frames processed")
