@@ -15,10 +15,12 @@ def main():
     print(f"Ball detection threshold: {tracker.class_thresholds[0]}")
     
     processed_frames = tracker.process_video(
-        input_path="input.mp4",
-        output_path="output.mp4",
-        use_existing_tracks=True,
-        tracks_path="tracks.pkl"
+        input_path='input.mp4',
+        output_path='output_with_camera_movement.mp4',
+        tracks_path='tracks.pkl',
+        camera_movement_stub_path='camera_movement.pkl',  # Will save/load camera movement data
+        use_camera_movement=True,  # Enable camera movement compensation
+        show_camera_movement=True  # Show camera movement overlay
     )
     
     print(f"\n✅ Video processing completed!")

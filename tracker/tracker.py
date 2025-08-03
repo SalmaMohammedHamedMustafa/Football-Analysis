@@ -13,6 +13,7 @@ sys.path.append('../')
 from team_assigner import TeamAssigner
 from my_utils import get_bbox_width, get_center_of_bbox, get_bbox_height
 from ball_control_tracker import BallControlTracker
+from camera_movement_estimator import CameraMovementEstimator
 
 
 class Tracker:
@@ -36,6 +37,8 @@ class Tracker:
         self.model = None
         self.team_assigner = TeamAssigner()
         self.team_colors_assigned = False
+        self.camera_movement_estimator = None
+        self.camera_movement_per_frame = None
         
         # Class-specific confidence thresholds for better detection
         self.class_thresholds = {
@@ -62,6 +65,85 @@ class Tracker:
             print(f"Loaded model: {self.model_path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
+
+
+    def _setup_camera_movement_estimation(self, video_path: Path, camera_movement_stub_path: Optional[Path] = None, use_camera_movement: bool = True):
+        """
+        Setup camera movement estimation for the video.
+        
+        Args:
+            video_path: Path to input video
+            camera_movement_stub_path: Path to save/load camera movement data
+            use_camera_movement: Whether to enable camera movement compensation
+        """
+        if not use_camera_movement:
+            print("Camera movement compensation disabled")
+            return
+        
+        print("Setting up camera movement estimation...")
+        
+        # Get first frame for initialization
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video for camera movement setup: {video_path}")
+        
+        ret, first_frame = cap.read()
+        cap.release()
+        
+        if not ret:
+            raise ValueError("Cannot read first frame for camera movement setup")
+        
+        # Initialize camera movement estimator
+        self.camera_movement_estimator = CameraMovementEstimator(first_frame)
+        
+        # Calculate camera movement for entire video
+        self.camera_movement_per_frame = self.camera_movement_estimator.get_camera_movement_streaming(
+            video_path, 
+            read_from_stub=True if camera_movement_stub_path else False,
+            stub_path=camera_movement_stub_path
+        )
+        
+        print(f"Camera movement estimation complete: {len(self.camera_movement_per_frame)} frames")
+    
+    def _adjust_tracks_for_camera_movement(self, tracks: dict[int, list], frame_idx: int) -> list:
+        """
+        Adjust track positions for camera movement.
+        
+        Args:
+            tracks: List of tracks for current frame
+            frame_idx: Current frame index
+            
+        Returns:
+            Adjusted tracks
+        """
+        if (self.camera_movement_estimator is None or 
+            self.camera_movement_per_frame is None or 
+            frame_idx >= len(self.camera_movement_per_frame)):
+            return tracks
+        
+        camera_movement = self.camera_movement_per_frame[frame_idx]
+        adjusted_tracks = []
+        
+        for track in tracks:
+            adjusted_track = track.copy()
+            
+            # Adjust bounding box for camera movement
+            adjusted_bbox = self.camera_movement_estimator.adjust_bbox_for_camera_movement(
+                track['bbox'], camera_movement
+            )
+            adjusted_track['bbox'] = adjusted_bbox
+            
+            # Store original and adjusted positions for analysis
+            original_center = get_center_of_bbox(track['bbox'])
+            adjusted_center = get_center_of_bbox(adjusted_bbox)
+            
+            adjusted_track['position_original'] = original_center
+            adjusted_track['position_adjusted'] = adjusted_center
+            adjusted_track['camera_movement'] = camera_movement
+            
+            adjusted_tracks.append(adjusted_track)
+        
+        return adjusted_tracks
     
     def _get_video_info(self, video_path: Path) -> Tuple[int, int, int, float]:
         """
@@ -331,69 +413,64 @@ class Tracker:
         
         return tracked_detections
 
-    def _generate_tracks(self, video_path: Path, tracks_path: Optional[Path] = None) -> Dict[str, Any]:
+    def _generate_tracks_with_camera_adjustment(self, video_path: Path, tracks_path: Optional[Path] = None) -> Dict[str, Any]:
         """
-        Generate tracks using hybrid approach with ball position interpolation:
-        - YOLO predict for balls (like your working method)
-        - Linear interpolation to fill missing ball positions using pandas
-        - YOLO track for players/referees (for consistent tracking)
+        Generate tracks with camera movement adjustment.
+        This is your existing _generate_tracks method with camera movement integration.
         """
         # Try to load existing tracks
         if tracks_path and tracks_path.exists():
             print(f"Loading existing tracks from: {tracks_path}")
             try:
                 with open(tracks_path, 'rb') as f:
-                    return pickle.load(f)
+                    tracks = pickle.load(f)
+                    
+                # Check if tracks already have camera movement adjustment
+                if any('position_adjusted' in track for frame_tracks in tracks.values() 
+                       for track in frame_tracks):
+                    print("Tracks already contain camera movement adjustments")
+                    return tracks
+                else:
+                    print("Tracks loaded but need camera movement adjustment")
+                    
             except Exception as e:
                 print(f"Failed to load tracks: {e}. Generating new tracks...")
         
-        print("Generating hybrid tracks: predict for balls with interpolation, track for players...")
+        # Generate tracks using your existing method
+        print("Generating tracks with camera movement adjustment...")
         
-        # Get video info to know total frames for interpolation
+        # Get video info
         width, height, total_frames, fps = self._get_video_info(video_path)
         
-        # Get ball detections using video predict (your working method)
+        # Get ball detections using video predict
         ball_detections = self._get_ball_detections_from_video(video_path)
         
-        # INTERPOLATION STEP: Apply pandas linear interpolation to fill missing ball positions
-        # This is the core enhancement - post-processing step to improve ball tracking continuity
+        # Apply interpolation to ball positions
         interpolated_ball_detections = self._interpolate_ball_positions(ball_detections, total_frames)
         
         # Get tracked detections for players/referees
         tracked_detections = self._get_tracked_detections_from_video(video_path)
         
-        # Combine interpolated ball detections and tracked detections
+        # Combine detections
         combined_tracks = {}
         max_frames = max(len(interpolated_ball_detections), len(tracked_detections))
         
         for frame_idx in range(max_frames):
             frame_tracks = []
             
-            # Add interpolated ball detections for this frame
+            # Add ball detections
             if frame_idx in interpolated_ball_detections:
                 frame_tracks.extend(interpolated_ball_detections[frame_idx])
             
-            # Add tracked detections for this frame
+            # Add tracked detections
             if frame_idx in tracked_detections:
                 frame_tracks.extend(tracked_detections[frame_idx])
             
+            # Apply camera movement adjustment if available
+            if self.camera_movement_per_frame is not None:
+                frame_tracks = self._adjust_tracks_for_camera_movement(frame_tracks, frame_idx)
+            
             combined_tracks[frame_idx] = frame_tracks
-        
-        # Print combined statistics with interpolation details
-        total_balls = sum(len([t for t in tracks if t['original_class'] == 0]) 
-                         for tracks in combined_tracks.values())
-        total_interpolated_balls = sum(len([t for t in tracks if t['original_class'] == 0 and t.get('interpolated', False)]) 
-                                     for tracks in combined_tracks.values())
-        total_players = sum(len([t for t in tracks if t['original_class'] in [1, 2, 3]]) 
-                           for tracks in combined_tracks.values())
-        frames_with_balls = sum(1 for tracks in combined_tracks.values() 
-                               if any(t['original_class'] == 0 for t in tracks))
-        
-        print(f"Combined tracking results with interpolation:")
-        print(f"  Total frames: {max_frames}")
-        print(f"  Ball detections: {total_balls} (including {total_interpolated_balls} interpolated)")
-        print(f"  Player/referee detections: {total_players}")
-        print(f"  Frames with balls: {frames_with_balls} ({frames_with_balls/max_frames*100:.1f}%)")
         
         # Save tracks if path provided
         if tracks_path:
@@ -401,7 +478,7 @@ class Tracker:
             try:
                 with open(tracks_path, 'wb') as f:
                     pickle.dump(combined_tracks, f)
-                print(f"Combined tracks with interpolation saved to: {tracks_path}")
+                print(f"Tracks with camera adjustment saved to: {tracks_path}")
             except Exception as e:
                 print(f"Failed to save tracks: {e}")
         
@@ -566,7 +643,7 @@ class Tracker:
 
         return frame
 
-    def _draw_annotations(self, frame, frame_tracks: list, frame_idx: int = 0):
+    def _draw_annotations(self, frame, frame_tracks: list, frame_idx: int = 0, show_camera_movement: bool = True):
         """
         Draw tracking annotations on a frame using triangles for balls and ellipses for other objects.
         Enhanced with team-based coloring for players, visual indication for interpolated balls,
@@ -581,6 +658,13 @@ class Tracker:
             Annotated frame
         """
         annotated_frame = frame.copy()
+
+        if (show_camera_movement and 
+            self.camera_movement_per_frame is not None and 
+            self.camera_movement_estimator is not None):
+            annotated_frame = self.camera_movement_estimator.draw_camera_movement(
+                annotated_frame, self.camera_movement_per_frame, frame_idx
+            )
         
         # Try to assign team colors if not already done
         self._assign_teams_for_frame(annotated_frame, frame_tracks)
@@ -661,17 +745,22 @@ class Tracker:
         return annotated_frame
 
     def process_video(self, 
-                    input_path: str, 
-                    output_path: str,
-                    tracks_path: Optional[str] = None,
-                    use_existing_tracks: bool = True) -> int:
+                input_path: str, 
+                output_path: str,
+                tracks_path: Optional[str] = None,
+                camera_movement_stub_path: Optional[str] = None,
+                use_existing_tracks: bool = True,
+                use_camera_movement: bool = True,
+                show_camera_movement: bool = True) -> int:
         """
         Process video using YOLO predict on entire video with ball position interpolation.
-        Enhanced with team assignment functionality, pandas-based interpolation, and ball control tracking.
+        Enhanced with team assignment functionality, pandas-based interpolation, ball control tracking,
+        and camera movement compensation.
         """
         input_path = Path(input_path)
         output_path = Path(output_path)
         tracks_path = Path(tracks_path) if tracks_path else None
+        camera_movement_stub_path = Path(camera_movement_stub_path) if camera_movement_stub_path else None
         
         if not input_path.exists():
             raise FileNotFoundError(f"Input video not found: {input_path}")
@@ -679,6 +768,7 @@ class Tracker:
         print(f"Processing video: {input_path}")
         print(f"Output will be saved to: {output_path}")
         print(f"Using hybrid approach with ball interpolation and possession tracking: video predict for balls + pandas interpolation, video track for players")
+        print(f"Camera movement compensation: {'Enabled' if use_camera_movement else 'Disabled'}")
         
         # Get video properties
         try:
@@ -687,6 +777,21 @@ class Tracker:
         except Exception as e:
             print(f"Error getting video info: {e}")
             return 0
+        
+        # Setup camera movement estimation BEFORE generating tracks
+        if use_camera_movement:
+            print("Setting up camera movement estimation...")
+            try:
+                self._setup_camera_movement_estimation(
+                    input_path, 
+                    camera_movement_stub_path,
+                    use_camera_movement
+                )
+                print(f"Camera movement estimation complete: {len(self.camera_movement_per_frame)} frames")
+            except Exception as e:
+                print(f"Error setting up camera movement: {e}")
+                print("Continuing without camera movement compensation...")
+                use_camera_movement = False
         
         # Reset ball control tracker for new video
         self.ball_control_tracker.reset()
@@ -697,11 +802,14 @@ class Tracker:
         self.ball_control_tracker.possession_distance_threshold = adjusted_distance_threshold
         print(f"Ball possession distance threshold auto-adjusted to: {adjusted_distance_threshold:.1f} pixels")
         
-        # Generate or load tracks using hybrid approach with interpolation
+        # Generate or load tracks using hybrid approach with interpolation and camera movement
         tracks = None
         if use_existing_tracks and tracks_path:
             try:
-                tracks = self._generate_tracks(input_path, tracks_path)
+                if use_camera_movement:
+                    tracks = self._generate_tracks_with_camera_adjustment(input_path, tracks_path)
+                else:
+                    tracks = self._generate_tracks(input_path, tracks_path)
             except Exception as e:
                 print(f"Error with tracks: {e}")
                 print("Falling back to real-time tracking...")
@@ -724,6 +832,8 @@ class Tracker:
         possession_start_frame = -1
         
         print("Starting video annotation with team assignment, interpolated ball positions, and possession tracking...")
+        if use_camera_movement:
+            print("Camera movement compensation is active")
         
         try:
             while True:
@@ -733,11 +843,13 @@ class Tracker:
                 
                 # Get tracking data for current frame
                 if tracks and processed_frames in tracks:
-                    # Use pre-generated hybrid tracks with interpolation
+                    # Use pre-generated hybrid tracks with interpolation and camera adjustment
                     frame_tracks = tracks[processed_frames]
                     if frame_tracks:
-                        # Pass frame index for possession tracking
-                        annotated_frame = self._draw_annotations(frame, frame_tracks, processed_frames)
+                        # Pass frame index for possession tracking and show camera movement if enabled
+                        annotated_frame = self._draw_annotations(
+                            frame, frame_tracks, processed_frames, show_camera_movement
+                        )
                         
                         # Count frames with balls and interpolated balls
                         if any(track['original_class'] == 0 for track in frame_tracks):
@@ -755,15 +867,31 @@ class Tracker:
                             possession_start_frame = processed_frames
                     else:
                         annotated_frame = frame.copy()
+                        
+                        # Still show camera movement even if no tracks
+                        if (show_camera_movement and use_camera_movement and 
+                            self.camera_movement_per_frame is not None and 
+                            self.camera_movement_estimator is not None):
+                            annotated_frame = self.camera_movement_estimator.draw_camera_movement(
+                                annotated_frame, self.camera_movement_per_frame, processed_frames
+                            )
                 else:
                     # Fallback: no pre-generated tracks available
                     annotated_frame = frame.copy()
+                    
+                    # Still show camera movement even without tracks
+                    if (show_camera_movement and use_camera_movement and 
+                        self.camera_movement_per_frame is not None and 
+                        self.camera_movement_estimator is not None):
+                        annotated_frame = self.camera_movement_estimator.draw_camera_movement(
+                            annotated_frame, self.camera_movement_per_frame, processed_frames
+                        )
                 
                 # Write the annotated frame
                 writer.write(annotated_frame)
                 processed_frames += 1
                 
-                # Progress update with ball, interpolation, team, and possession statistics
+                # Progress update with ball, interpolation, team, possession, and camera movement statistics
                 if processed_frames % 100 == 0:
                     progress = (processed_frames / total_frames) * 100 if total_frames > 0 else 0
                     ball_percentage = (ball_frames_count / processed_frames) * 100
@@ -774,7 +902,10 @@ class Tracker:
                     current_possession = self.ball_control_tracker.get_current_possession()
                     possession_status = f"Team {current_possession}" if current_possession else "none"
                     
-                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}% (interpolated: {interpolated_percentage:.1f}%) - Teams: {team_status} - Possession: {possession_status}")
+                    # Camera movement status for progress
+                    camera_status = "enabled" if use_camera_movement else "disabled"
+                    
+                    print(f"   Progress: {processed_frames}/{total_frames} ({progress:.1f}%) - Ball presence: {ball_percentage:.1f}% (interpolated: {interpolated_percentage:.1f}%) - Teams: {team_status} - Possession: {possession_status} - Camera: {camera_status}")
         
         except Exception as e:
             print(f"Error during processing: {e}")
@@ -782,7 +913,7 @@ class Tracker:
             cap.release()
             writer.release()
         
-        # Final statistics with interpolation and possession details
+        # Final statistics with interpolation, possession, and camera movement details
         final_ball_percentage = (ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
         final_interpolated_percentage = (interpolated_ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
         
@@ -835,6 +966,47 @@ class Tracker:
                 print(f"  Possession changes per minute: {changes_per_minute:.1f}")
         else:
             print(f"  No possession data available (teams not assigned or ball not detected sufficiently)")
+        
+        # Camera movement statistics
+        print(f"\nCamera Movement Analysis:")
+        print(f"  Camera movement compensation: {'Enabled' if use_camera_movement else 'Disabled'}")
+        
+        if use_camera_movement and self.camera_movement_per_frame:
+            # Calculate camera movement statistics
+            movements = self.camera_movement_per_frame
+            total_movement = sum(abs(x) + abs(y) for x, y in movements)
+            avg_movement_per_frame = total_movement / len(movements) if movements else 0
+            max_movement = max(abs(x) + abs(y) for x, y in movements) if movements else 0
+            
+            # Calculate frames with significant movement
+            significant_movement_threshold = 5.0  # pixels
+            frames_with_movement = sum(1 for x, y in movements if abs(x) + abs(y) > significant_movement_threshold)
+            movement_frame_percentage = (frames_with_movement / len(movements)) * 100 if movements else 0
+            
+            print(f"  Total camera movement: {total_movement:.2f} pixels")
+            print(f"  Average movement per frame: {avg_movement_per_frame:.2f} pixels")
+            print(f"  Maximum frame movement: {max_movement:.2f} pixels")
+            print(f"  Frames with significant movement: {frames_with_movement}/{len(movements)} ({movement_frame_percentage:.1f}%)")
+            print(f"  Camera movement data saved to: {camera_movement_stub_path if camera_movement_stub_path else 'Not saved'}")
+            
+            # Movement intensity classification
+            if avg_movement_per_frame < 1.0:
+                movement_intensity = "Very stable (minimal camera movement)"
+            elif avg_movement_per_frame < 3.0:
+                movement_intensity = "Stable (low camera movement)"
+            elif avg_movement_per_frame < 8.0:
+                movement_intensity = "Moderate (medium camera movement)"
+            elif avg_movement_per_frame < 15.0:
+                movement_intensity = "Active (high camera movement)"
+            else:
+                movement_intensity = "Very active (very high camera movement)"
+            
+            print(f"  Movement intensity: {movement_intensity}")
+        else:
+            if use_camera_movement:
+                print(f"  Camera movement data: Not available (calculation failed)")
+            else:
+                print(f"  Camera movement tracking was disabled")
         
         print(f"\nOutput saved to: {output_path}")
         print(f"Processing complete! {processed_frames} frames processed")
@@ -927,3 +1099,23 @@ class Tracker:
             self.ball_control_tracker.min_frames_for_possession = min_frames
         if smoothing_window is not None:
             self.ball_control_tracker.possession_smoothing_window = smoothing_window
+
+
+        def get_camera_movement_stats(self) -> dict:
+            """Get camera movement statistics."""
+            if self.camera_movement_per_frame is None:
+                return {"enabled": False}
+            
+            movements = self.camera_movement_per_frame
+            total_movement = sum(abs(x) + abs(y) for x, y in movements)
+            avg_movement = total_movement / len(movements) if movements else 0
+            max_movement = max(abs(x) + abs(y) for x, y in movements) if movements else 0
+            
+            return {
+                "enabled": True,
+                "total_frames": len(movements),
+                "total_movement": total_movement,
+                "average_movement_per_frame": avg_movement,
+                "maximum_frame_movement": max_movement,
+                "movement_data": movements
+            }

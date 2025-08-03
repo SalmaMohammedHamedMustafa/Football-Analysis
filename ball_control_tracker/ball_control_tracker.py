@@ -222,11 +222,11 @@ class BallControlTracker:
         # Get frame dimensions
         height, width = frame.shape[:2]
         
-        # Possession indicator position (top-left corner)
-        indicator_x = 30
-        indicator_y = 50
+        # Possession indicator position (bottom-right corner)
         indicator_width = 200
         indicator_height = 40
+        indicator_x = width - indicator_width - 30
+        indicator_y = height - 50
         
         # Get team color
         team_color = team_colors.get(possession_team, (128, 128, 128))
