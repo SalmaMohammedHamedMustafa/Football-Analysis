@@ -1,3 +1,4 @@
+# SoccerVisionAI
 # Soccer Video Tracking & Analytics
 
 **A  modular pipeline for soccer analytics from video.**
@@ -5,6 +6,7 @@
 
 ## Table of Contents
 
+- [SoccerVisionAI](#soccervisionai)
 - [Soccer Video Tracking \& Analytics](#soccer-video-tracking--analytics)
   - [Table of Contents](#table-of-contents)
   - [Project Overview](#project-overview)
