@@ -15,6 +15,7 @@ from my_utils import get_bbox_width, get_center_of_bbox, get_bbox_height
 from ball_control_tracker import BallControlTracker
 from camera_movement_estimator import CameraMovementEstimator
 from view_transformer import ViewTransformer
+from speed_and_distance_estimator import SpeedAndDistance_Estimator
 
 
 class Tracker:
@@ -41,6 +42,7 @@ class Tracker:
         self.camera_movement_estimator = None
         self.camera_movement_per_frame = None
         self.view_transformer = ViewTransformer()
+        self.speed_and_distance_estimator = SpeedAndDistance_Estimator()
         
         # Class-specific confidence thresholds for better detection
         self.class_thresholds = {
@@ -110,6 +112,7 @@ class Tracker:
     def _adjust_tracks_for_camera_movement(self, tracks: list, frame_idx: int) -> list:
         """
         Adjust track positions for camera movement and add transformed positions.
+        Fixed version that ensures consistent coordinate systems for speed calculation.
         
         Args:
             tracks: List of tracks for current frame
@@ -122,6 +125,7 @@ class Tracker:
             self.camera_movement_per_frame is None or 
             frame_idx >= len(self.camera_movement_per_frame)):
             adjusted_tracks = tracks
+            camera_movement = [0, 0]  # No movement
         else:
             camera_movement = self.camera_movement_per_frame[frame_idx]
             adjusted_tracks = []
@@ -147,7 +151,7 @@ class Tracker:
         
         # Add transformed positions for all tracks
         for track in adjusted_tracks:
-            # Use adjusted position if available, otherwise use original position
+            # IMPORTANT: Use adjusted position consistently if available
             if 'position_adjusted' in track:
                 position = np.array(track['position_adjusted'])
             else:
@@ -157,10 +161,223 @@ class Tracker:
             position_transformed = self.view_transformer.transform_point(position)
             if position_transformed is not None:
                 position_transformed = position_transformed.squeeze().tolist()
+                track['position_transformed'] = position_transformed
+            else:
+                track['position_transformed'] = None
             
-            track['position_transformed'] = position_transformed
+            # Store which position was used for transformation for debugging
+            track['transform_source'] = 'adjusted' if 'position_adjusted' in track else 'original'
         
         return adjusted_tracks
+
+
+    def _print_enhanced_speed_statistics(self, tracks, processed_frames, fps):
+        """
+        Print enhanced speed statistics using the improved speed estimator.
+        """
+        if not tracks:
+            print(f"  No speed and distance data available (no tracks generated)")
+            return
+        
+        # Get detailed statistics from the speed estimator
+        speed_stats = self.speed_and_distance_estimator.get_speed_statistics(tracks)
+        
+        print(f"\nSpeed and Distance Analysis (Enhanced v2):")
+        print(f"  Speed and distance calculation: Enabled (Improved Filtering)")
+        print(f"  Frame rate used for calculations: {fps:.2f} FPS")
+        print(f"  Frame window for speed calculation: {self.speed_and_distance_estimator.frame_window} frames")
+        print(f"  Min frame gap for calculations: {self.speed_and_distance_estimator.min_frame_gap} frames")
+        print(f"  Time window per calculation: {self.speed_and_distance_estimator.frame_window/fps:.2f} seconds")
+        print(f"  Max reasonable speed threshold: {self.speed_and_distance_estimator.max_reasonable_speed} km/h")
+        print(f"  Min distance threshold: {self.speed_and_distance_estimator.min_distance_threshold} meters")
+        
+        # Coordinate system usage
+        coord_usage = speed_stats['coordinate_system_usage']
+        total_coord_measurements = sum(coord_usage.values())
+        if total_coord_measurements > 0:
+            print(f"\n  Coordinate System Usage:")
+            for coord_type, count in coord_usage.items():
+                percentage = (count / total_coord_measurements) * 100
+                coord_name = {
+                    'transformed': 'Court coordinates (meters)',
+                    'adjusted': 'Camera-adjusted pixels', 
+                    'pixel': 'Original pixels'
+                }.get(coord_type, coord_type)
+                print(f"    {coord_name}: {count} ({percentage:.1f}%)")
+        
+        # Overall statistics
+        all_stats = speed_stats['all_speeds']
+        if all_stats['count'] > 0:
+            print(f"\n  Overall Speed Statistics:")
+            print(f"    Total measurements: {all_stats['count']}")
+            print(f"    Average speed: {all_stats['mean']:.2f} km/h")
+            print(f"    Median speed: {all_stats['median']:.2f} km/h")
+            print(f"    Maximum speed: {all_stats['max']:.2f} km/h")
+            print(f"    95th percentile: {all_stats['percentile_95']:.2f} km/h")
+            print(f"    99th percentile: {all_stats['percentile_99']:.2f} km/h")
+            print(f"    Standard deviation: {all_stats['std']:.2f} km/h")
+            
+            # Realistic speed assessment - adjusted for balanced filtering
+            if all_stats['max'] > 30.0:
+                print(f"    ⚠️  Maximum speed is high - check for tracking errors")
+            elif all_stats['max'] > 35.0:
+                print(f"    ❌ Maximum speed is unrealistic for soccer")
+            else:
+                print(f"    ✓ Maximum speed within realistic range")
+                
+            print(f"    Recommended focus: Median ({all_stats['median']:.2f} km/h)")
+        
+        # Enhanced player speed categories
+        player_stats = speed_stats['player_speeds']
+        if player_stats['count'] > 0:
+            print(f"\n  Player Speed Statistics:")
+            print(f"    Player measurements: {player_stats['count']}")
+            print(f"    Average player speed: {player_stats['mean']:.2f} km/h")
+            print(f"    Median player speed: {player_stats['median']:.2f} km/h")
+            print(f"    Maximum player speed: {player_stats['max']:.2f} km/h")
+            print(f"    Player speed std dev: {player_stats['std']:.2f} km/h")
+            
+            # Enhanced speed categories with realistic thresholds
+            speed_categories = speed_stats.get('speed_categories', {})
+            speed_percentages = speed_stats.get('speed_category_percentages', {})
+            
+            if speed_categories:
+                print(f"\n    Player Movement Categories (Realistic Thresholds):")
+                print(f"    Stationary/Very slow (<1 km/h): {speed_categories.get('stationary', 0)} ({speed_percentages.get('stationary', 0):.1f}%)")
+                print(f"    Walking (1-5 km/h): {speed_categories.get('walking', 0)} ({speed_percentages.get('walking', 0):.1f}%)")
+                print(f"    Jogging (5-10 km/h): {speed_categories.get('jogging', 0)} ({speed_percentages.get('jogging', 0):.1f}%)")
+                print(f"    Running (10-18 km/h): {speed_categories.get('running', 0)} ({speed_percentages.get('running', 0):.1f}%)")
+                print(f"    Sprinting (>18 km/h): {speed_categories.get('sprinting', 0)} ({speed_percentages.get('sprinting', 0):.1f}%)")
+                
+                # Movement intensity assessment
+                sprinting_percentage = speed_percentages.get('sprinting', 0)
+                running_percentage = speed_percentages.get('running', 0)
+                
+                if sprinting_percentage > 30:
+                    print(f"    ⚠️  High sprinting percentage - may indicate tracking errors")
+                elif sprinting_percentage > 15:
+                    print(f"    ⚠️  Moderate sprinting percentage - review for accuracy")
+                else:
+                    print(f"    ✓ Sprinting percentage seems realistic")
+                    
+                if running_percentage + sprinting_percentage > 60:
+                    print(f"    ⚠️  High fast movement percentage - check tracking accuracy")
+                else:
+                    print(f"    ✓ Movement distribution appears realistic")
+        
+        # Ball statistics
+        ball_stats = speed_stats['ball_speeds']
+        if ball_stats['count'] > 0:
+            print(f"\n  Ball Speed Statistics:")
+            print(f"    Ball measurements: {ball_stats['count']}")
+            print(f"    Average ball speed: {ball_stats['mean']:.2f} km/h")
+            print(f"    Maximum ball speed: {ball_stats['max']:.2f} km/h")
+            
+            if ball_stats['max'] > 60.0:
+                print(f"    ⚠️  Very high ball speed detected")
+            elif ball_stats['max'] > 80.0:
+                print(f"    ❌ Unrealistic ball speed - check tracking")
+        
+        # Distance statistics (unchanged but with improved context)
+        total_distances = {}
+        for frame_tracks in tracks.values():
+            for track in frame_tracks:
+                track_id = track['track_id']
+                distance = track.get('distance')
+                if distance is not None:
+                    total_distances[track_id] = max(total_distances.get(track_id, 0), distance)
+        
+        if total_distances:
+            player_distances = []
+            ball_distances = []
+            
+            # Categorize distances by track type
+            for frame_tracks in tracks.values():
+                for track in frame_tracks:
+                    track_id = track['track_id']
+                    if track_id in total_distances:
+                        distance = total_distances[track_id]
+                        if track.get('class') in [1, 2]:  # Players
+                            player_distances.append(distance)
+                        elif track.get('class') == 0:  # Ball
+                            ball_distances.append(distance)
+            
+            # Remove duplicates and get unique distances
+            player_distances = list(set(player_distances))
+            ball_distances = list(set(ball_distances))
+            
+            if player_distances:
+                print(f"\n  Distance Statistics:")
+                print(f"    Players tracked: {len(player_distances)}")
+                print(f"    Total player distance: {sum(player_distances):.2f} meters")
+                print(f"    Average distance per player: {np.mean(player_distances):.2f} meters")
+                print(f"    Maximum player distance: {max(player_distances):.2f} meters")
+                
+                # Distance realism check
+                game_duration_minutes = processed_frames / fps / 60
+                avg_distance_per_minute = np.mean(player_distances) / game_duration_minutes
+                print(f"    Average distance per player per minute: {avg_distance_per_minute:.2f} m/min")
+                
+                if avg_distance_per_minute > 200:  # Very high for soccer
+                    print(f"    ⚠️  High distance per minute - check for tracking errors")
+                elif avg_distance_per_minute < 50:   # Very low for active soccer
+                    print(f"    ⚠️  Low distance per minute - may miss some movement")
+                else:
+                    print(f"    ✓ Distance per minute seems realistic")
+            
+            if ball_distances:
+                print(f"    Ball total distance: {max(ball_distances):.2f} meters")
+        
+        # Enhanced performance insights
+        game_duration_minutes = processed_frames / fps / 60
+        print(f"\n  Performance Insights:")
+        print(f"    Analysis duration: {game_duration_minutes:.1f} minutes")
+        
+        if coord_usage.get('transformed', 0) > 0:
+            print(f"    ✓ Using court coordinates for accurate measurements")
+        elif coord_usage.get('adjusted', 0) > 0:
+            print(f"    ⚠️ Using camera-adjusted pixels (less accurate)")
+        else:
+            print(f"    ⚠️ Using original pixels (least accurate)")
+        
+        # Enhanced speed data quality assessment
+        if all_stats['count'] > 0:
+            # More realistic speed bounds for soccer - balanced approach
+            realistic_speeds = sum(1 for frame_tracks in tracks.values() 
+                                for track in frame_tracks 
+                                if track.get('speed') is not None and 
+                                    0 <= track['speed'] <= 30)  # Slightly more generous
+            
+            total_speed_measurements = all_stats['count']
+            realistic_percentage = (realistic_speeds / total_speed_measurements) * 100
+            print(f"    Speed data quality: {realistic_percentage:.1f}% realistic speeds")
+            
+            if realistic_percentage < 70:
+                print(f"    ❌ Poor speed data quality - significant tracking issues")
+            elif realistic_percentage < 85:
+                print(f"    ⚠️  Moderate speed data quality - some tracking errors")
+            else:
+                print(f"    ✓ Good speed data quality")
+            
+            # Additional quality metrics
+            zero_speeds = sum(1 for frame_tracks in tracks.values() 
+                            for track in frame_tracks 
+                            if track.get('speed') == 0.0)
+            
+            if zero_speeds > 0:
+                zero_percentage = (zero_speeds / total_speed_measurements) * 100
+                print(f"    Zero/minimal movement: {zero_percentage:.1f}% (expected for stationary periods)")
+        
+        # Filtering effectiveness summary
+        print(f"\n  Filtering Effectiveness:")
+        print(f"    Enhanced filtering applied with:")
+        print(f"    - Class-specific speed limits (Player: 28 km/h, Ball: 80 km/h)")
+        print(f"    - Minimum frame gap: {self.speed_and_distance_estimator.min_frame_gap} frames")
+        print(f"    - Acceleration limits: 8 m/s² for players (balanced)")
+        print(f"    - Coordinate system consistency checks")
+        print(f"    - Balanced noise filtering: {self.speed_and_distance_estimator.min_distance_threshold}m minimum movement")
+
+
     
     def _get_video_info(self, video_path: Path) -> Tuple[int, int, int, float]:
         """
@@ -432,8 +649,8 @@ class Tracker:
 
     def _generate_tracks_with_camera_adjustment(self, video_path: Path, tracks_path: Optional[Path] = None) -> Dict[str, Any]:
         """
-        Generate tracks with camera movement adjustment and view transformation.
-        This is your existing _generate_tracks method with camera movement integration and view transformation.
+        Generate tracks with camera movement adjustment, view transformation, and speed/distance calculation.
+        This is your existing _generate_tracks method with camera movement integration, view transformation, and speed analysis.
         """
         # Try to load existing tracks
         if tracks_path and tracks_path.exists():
@@ -442,48 +659,66 @@ class Tracker:
                 with open(tracks_path, 'rb') as f:
                     tracks = pickle.load(f)
                     
-                # Check if tracks already have camera movement adjustment and view transformation
+                # Check if tracks already have all enhancements
                 sample_tracks = next(iter(tracks.values())) if tracks else []
                 has_camera_adjustment = any('position_adjusted' in track for track in sample_tracks)
                 has_view_transformation = any('position_transformed' in track for track in sample_tracks)
+                has_speed_distance = any('speed' in track for track in sample_tracks)
                 
-                if has_camera_adjustment and has_view_transformation:
-                    print("Tracks already contain camera movement adjustments and view transformations")
+                if has_camera_adjustment and has_view_transformation and has_speed_distance:
+                    print("Tracks already contain camera movement adjustments, view transformations, and speed/distance data")
                     return tracks
-                elif has_camera_adjustment and not has_view_transformation:
-                    print("Tracks have camera movement adjustments but need view transformation")
-                    # Add view transformations to existing tracks
-                    for frame_idx, frame_tracks in tracks.items():
-                        for track in frame_tracks:
-                            if 'position_adjusted' in track:
-                                position = np.array(track['position_adjusted'])
-                            else:
-                                position = np.array(get_center_of_bbox(track['bbox']))
-                            
-                            position_transformed = self.view_transformer.transform_point(position)
-                            if position_transformed is not None:
-                                position_transformed = position_transformed.squeeze().tolist()
-                            
-                            track['position_transformed'] = position_transformed
+                else:
+                    missing_features = []
+                    if not has_camera_adjustment:
+                        missing_features.append("camera movement adjustments")
+                    if not has_view_transformation:
+                        missing_features.append("view transformations")
+                    if not has_speed_distance:
+                        missing_features.append("speed/distance calculations")
+                    
+                    print(f"Tracks loaded but need: {', '.join(missing_features)}")
+                    
+                    # Add missing features
+                    if not has_view_transformation:
+                        # Add view transformations to existing tracks
+                        for frame_idx, frame_tracks in tracks.items():
+                            for track in frame_tracks:
+                                if 'position_adjusted' in track:
+                                    position = np.array(track['position_adjusted'])
+                                else:
+                                    position = np.array(get_center_of_bbox(track['bbox']))
+                                
+                                position_transformed = self.view_transformer.transform_point(position)
+                                if position_transformed is not None:
+                                    position_transformed = position_transformed.squeeze().tolist()
+                                
+                                track['position_transformed'] = position_transformed
+                    
+                    if not has_speed_distance:
+                        # Add speed and distance calculations
+                        print("Calculating speed and distance for existing tracks...")
+                        self.speed_and_distance_estimator.add_speed_and_distance_to_tracks(tracks)
                     
                     # Save updated tracks
                     if tracks_path:
                         with open(tracks_path, 'wb') as f:
                             pickle.dump(tracks, f)
-                        print("Updated tracks with view transformations saved")
+                        print("Updated tracks with missing features saved")
                     
                     return tracks
-                else:
-                    print("Tracks loaded but need camera movement adjustment and view transformation")
                     
             except Exception as e:
                 print(f"Failed to load tracks: {e}. Generating new tracks...")
         
         # Generate tracks using your existing method
-        print("Generating tracks with camera movement adjustment and view transformation...")
+        print("Generating tracks with camera movement adjustment, view transformation, and speed/distance calculation...")
         
         # Get video info
         width, height, total_frames, fps = self._get_video_info(video_path)
+        
+        # Update frame rate for speed calculations
+        self.speed_and_distance_estimator.frame_rate = fps
         
         # Get ball detections using video predict
         ball_detections = self._get_ball_detections_from_video(video_path)
@@ -514,13 +749,17 @@ class Tracker:
             
             combined_tracks[frame_idx] = frame_tracks
         
+        # Add speed and distance calculations
+        print("Calculating speed and distance for all tracks...")
+        self.speed_and_distance_estimator.add_speed_and_distance_to_tracks(combined_tracks)
+        
         # Save tracks if path provided
         if tracks_path:
             tracks_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with open(tracks_path, 'wb') as f:
                     pickle.dump(combined_tracks, f)
-                print(f"Tracks with camera adjustment and view transformation saved to: {tracks_path}")
+                print(f"Tracks with camera adjustment, view transformation, and speed/distance saved to: {tracks_path}")
             except Exception as e:
                 print(f"Failed to save tracks: {e}")
         
@@ -963,7 +1202,7 @@ class Tracker:
             cap.release()
             writer.release()
         
-        # Final statistics with interpolation, possession, camera movement, and view transformation details
+        # Final statistics with interpolation, possession, camera movement, view transformation, and speed/distance details
         final_ball_percentage = (ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
         final_interpolated_percentage = (interpolated_ball_frames_count / processed_frames) * 100 if processed_frames > 0 else 0
         
@@ -1078,16 +1317,17 @@ class Tracker:
             print(f"  Pixel vertices: {self.view_transformer.pixel_vertices.tolist()}")
             print(f"  Target vertices: {self.view_transformer.target_vertices.tolist()}")
         
-        print(f"\nOutput saved to: {output_path}")
-        print(f"Processing complete! {processed_frames} frames processed")
-        print(f"="*60)
+
+
+        self._print_enhanced_speed_statistics(tracks, processed_frames, fps)
+
         
         return processed_frames
-    
+
     def _assign_teams_for_frame(self, frame, frame_tracks):
         """
         Assign team colors for the first frame with enough players.
-        
+
         Args:
             frame: Current frame
             frame_tracks: List of track data for this frame
