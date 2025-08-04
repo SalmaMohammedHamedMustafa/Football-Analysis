@@ -1,0 +1,19 @@
+# Core numerical/scientific libraries
+numpy>=1.21.0
+pandas>=1.3.0
+
+# Computer vision and video
+opencv-python>=4.5.5
+
+# YOLOv8 and Ultralytics ecosystem
+ultralytics>=8.0.0
+
+# Scikit-learn for clustering
+scikit-learn>=1.1.0
+
+# PyTorch (for Ultralytics/YOLO): let Ultralytics install the correct CPU/GPU variant,
+# or add one manually if using custom hardware.
+# torch>=1.11.0
+
+# Optional: if you read/write videos in other formats, you may need ffmpeg installed in your OS 
+# but do not pip-install, just note: FFmpeg recommended (see docs)
