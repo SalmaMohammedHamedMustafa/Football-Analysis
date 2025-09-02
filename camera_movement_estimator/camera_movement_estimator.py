@@ -27,8 +27,9 @@ class CameraMovementEstimator:
         
         first_frame_grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         mask_features = np.zeros_like(first_frame_grayscale)
-        mask_features[:, 0:20] = 1
-        mask_features[:, 900:1050] = 1
+        mask_features[0:20, :] = 1  # Top horizontal strip (first 20 rows)
+        mask_features[900:1050, :] = 1  # Bottom horizontal strip (rows 900 to 1050, all columns)
+
         
         self.features = dict(
             maxCorners=100,

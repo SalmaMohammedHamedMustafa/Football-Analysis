@@ -19,7 +19,6 @@ def main():
         output_path='output_with_camera_movement.mp4',
         tracks_path='tracks.pkl',
         camera_movement_stub_path='camera_movement.pkl',  # Will save/load camera movement data
-        use_camera_movement=True,  # Enable camera movement compensation
         show_camera_movement=True  # Show camera movement overlay
     )
     

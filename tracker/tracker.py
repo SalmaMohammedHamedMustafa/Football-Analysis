@@ -650,7 +650,6 @@ class Tracker:
     def _generate_tracks_with_camera_adjustment(self, video_path: Path, tracks_path: Optional[Path] = None) -> Dict[str, Any]:
         """
         Generate tracks with camera movement adjustment, view transformation, and speed/distance calculation.
-        This is your existing _generate_tracks method with camera movement integration, view transformation, and speed analysis.
         """
         # Try to load existing tracks
         if tracks_path and tracks_path.exists():
@@ -711,7 +710,7 @@ class Tracker:
             except Exception as e:
                 print(f"Failed to load tracks: {e}. Generating new tracks...")
         
-        # Generate tracks using your existing method
+        # Generate tracks
         print("Generating tracks with camera movement adjustment, view transformation, and speed/distance calculation...")
         
         # Get video info
@@ -1031,7 +1030,6 @@ class Tracker:
             tracks_path: Optional[str] = None,
             camera_movement_stub_path: Optional[str] = None,
             use_existing_tracks: bool = True,
-            use_camera_movement: bool = True,
             show_camera_movement: bool = True) -> int:
         """
         Process video using YOLO predict on entire video with ball position interpolation.
@@ -1061,19 +1059,18 @@ class Tracker:
             return 0
         
         # Setup camera movement estimation BEFORE generating tracks
-        if use_camera_movement:
-            print("Setting up camera movement estimation...")
-            try:
-                self._setup_camera_movement_estimation(
-                    input_path, 
-                    camera_movement_stub_path,
-                    use_camera_movement
-                )
-                print(f"Camera movement estimation complete: {len(self.camera_movement_per_frame)} frames")
-            except Exception as e:
-                print(f"Error setting up camera movement: {e}")
-                print("Continuing without camera movement compensation...")
-                use_camera_movement = False
+        print("Setting up camera movement estimation...")
+        try:
+            self._setup_camera_movement_estimation(
+                input_path, 
+                camera_movement_stub_path,
+                use_camera_movement
+            )
+            print(f"Camera movement estimation complete: {len(self.camera_movement_per_frame)} frames")
+        except Exception as e:
+            print(f"Error setting up camera movement: {e}")
+            print("Continuing without camera movement compensation...")
+            use_camera_movement = False
         
         # Reset ball control tracker for new video
         self.ball_control_tracker.reset()
@@ -1086,15 +1083,12 @@ class Tracker:
         
         # Generate or load tracks using hybrid approach with interpolation, camera movement, and view transformation
         tracks = None
-        if use_existing_tracks and tracks_path:
-            try:
-                if use_camera_movement:
-                    tracks = self._generate_tracks_with_camera_adjustment(input_path, tracks_path)
-                else:
-                    tracks = self._generate_tracks(input_path, tracks_path)
-            except Exception as e:
-                print(f"Error with tracks: {e}")
-                print("Falling back to real-time tracking...")
+        try:
+            tracks = self._generate_tracks_with_camera_adjustment(input_path, tracks_path)
+
+        except Exception as e:
+            print(f"Error with tracks: {e}")
+            print("Falling back to real-time tracking...")
         
         # Setup video capture and writer
         cap = cv2.VideoCapture(str(input_path))
